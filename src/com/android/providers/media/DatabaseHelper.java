@@ -237,7 +237,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         }
     }
 
-    @Override
+/*    @Override
     public SQLiteDatabase getReadableDatabase() {
         throw new UnsupportedOperationException("All database operations must be routed through"
                 + " runWithTransaction() or runWithoutTransaction() to avoid deadlocks");
@@ -247,7 +247,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
     public SQLiteDatabase getWritableDatabase() {
         throw new UnsupportedOperationException("All database operations must be routed through"
                 + " runWithTransaction() or runWithoutTransaction() to avoid deadlocks");
-    }
+    }*/
 
     @VisibleForTesting
     SQLiteDatabase getWritableDatabaseForTest() {
