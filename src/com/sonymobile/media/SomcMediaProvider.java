@@ -25,6 +25,7 @@ import android.text.TextUtils;
 import android.util.Log;
 import android.util.Pair;
 import android.webkit.MimeTypeMap;
+
 import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
@@ -40,34 +41,42 @@ import java.util.regex.Pattern;
 
 /* loaded from: classes.dex */
 public class SomcMediaProvider extends ContentProvider {
-    private static final boolean DEBUG = Log.isLoggable("SomcMediaProvider", 3);
+    private static final boolean DEBUG = true;
     private static final byte[] SOUND_PHOTO_ID  = new byte[] { 'S', 'P', 'F', 0 };// "SPF\0"
     private static final int JPEG_MARKER_SOI    = 0xFFD8;                         // file header
     private static final int JPEG_MARKER_PREFIX = 0xFF;                           // 0xFF lead-in
     private static final int JPEG_MARKER_APP3   = 0xE3;                           // -29 in byte
     private static final int JPEG_MARKER_SOS    = 0xDA;                           // -38 in byte
     private static final String MIME_TYPE_JPEG = "image/jpeg";
+    private static final String TAG = "SomcMediaProvider";
     private static final UriMatcher URI_MATCHER = new UriMatcher(-1);           // equals check
+    private final Object mDbLock = new Object();
 
-    private DatabaseHelper mDBHelper;
-    private SomcFileType mSomcFileType;
+    private DatabaseHelper mDBHelper = null;
+    private SomcFileType mSomcFileType = null;
     private boolean mIsHdrSupported = isHdrSupported();
+    
+    private volatile boolean mInitialized = false;
     
     private interface SomcCustomFunction {
     	void callback(String[] args);
     }
-        private final SomcCustomFunction mSomcFileTypeCallback = new SomcCustomFunction() { // from class: com.sonymobile.media.SomcMediaProvider.1
+
+    private final SomcCustomFunction mSomcFileTypeCallback = new SomcCustomFunction() { // from class: com.sonymobile.media.SomcMediaProvider.1
         public void callback(String[] args) {
+            if (!ensureInitialized()) {
+                return;
+            }
             Cursor c = null;
             try {
                 try {
-                    SQLiteDatabase db = SomcMediaProvider.this.mDBHelper.getWritableDBAsync();
+                    SQLiteDatabase db = SomcMediaProvider.this.mDBHelper.getWritableDB();
                     if (db != null) {
                         String rowId = args[0];
                         c = db.rawQuery("SELECT _data, mime_type, bucket_id FROM files_with_ext WHERE _id = ? AND somctype = -1;", new String[]{rowId});
                         if (c.moveToFirst() && c.getString(0) != null && new File(c.getString(0)).exists()) {
                             if (SomcMediaProvider.DEBUG) {
-                                Log.d("SomcMediaProvider", "updateFileType will be called. rowId=" + rowId);
+                                Log.d(TAG, "updateFileType will be called. rowId=" + rowId);
                             }
                             SomcMediaProvider.this.updateFileType(db, c.getString(0), c.getString(1), rowId);
                             SomcMediaProvider.this.updateCover(db, c.getString(0), c.getString(1), c.getString(2), true);
@@ -78,7 +87,7 @@ public class SomcMediaProvider extends ContentProvider {
                         return;
                     }
                 } catch (Exception e) {
-                    Log.e("SomcMediaProvider", "callback failed.", e);
+                    Log.e(TAG, "callback failed.", e);
                     if (c == null) {
                         return;
                     }
@@ -94,13 +103,16 @@ public class SomcMediaProvider extends ContentProvider {
     };
     private final SomcCustomFunction mCoverRemovedCallback = new SomcCustomFunction() { // from class: com.sonymobile.media.SomcMediaProvider.2
         public void callback(String[] args) {
+            if (!ensureInitialized()) {
+                return;
+            }
             try {
-                SQLiteDatabase db = SomcMediaProvider.this.mDBHelper.getWritableDBAsync();
+                SQLiteDatabase db = SomcMediaProvider.this.mDBHelper.getWritableDB();
                 if (db != null) {
                     SomcMediaProvider.this.updateCover(db, args[1], args[2], args[0], false);
                 }
             } catch (Exception e) {
-                Log.e("SomcMediaProvider", "callback failed.", e);
+                Log.e(TAG, "callback failed.", e);
             }
         }
     };
@@ -199,104 +211,51 @@ public class SomcMediaProvider extends ContentProvider {
         }
     }
 
-    private final class DatabaseHelper extends SQLiteOpenHelper {
+    private final class DatabaseHelper {
         private SomcCustomFunction mCb1;
         private SomcCustomFunction mCb2;
         private Context mContext;
-        private String mDBPath;
         private SQLiteOpenHelper mOrgDBHelper;
 
-        public DatabaseHelper(Context cxt, String name, SomcCustomFunction cb1, SomcCustomFunction cb2) {
-            super(cxt, name, (SQLiteDatabase.CursorFactory) null, 401);
-            this.mCb1 = cb1;
-            this.mCb2 = cb2;
-            this.mContext = cxt;
-        }
-
-        @Override // android.database.sqlite.SQLiteOpenHelper
-        public void onCreate(SQLiteDatabase db) throws SQLException {
-            if (SomcMediaProvider.DEBUG) {
-                Log.d("SomcMediaProvider", "DatabaseHelper onCreate()");
-            }
-            setFirstTime(true);
-            upgradeDatabase(db, 0, 401);
-        }
-
-        @Override // android.database.sqlite.SQLiteOpenHelper
-        public void onUpgrade(SQLiteDatabase db, int oldV, int newV) throws SQLException {
-            if (SomcMediaProvider.DEBUG) {
-                Log.d("SomcMediaProvider", "DatabaseHelper onUpgrade()");
-            }
-            upgradeDatabase(db, oldV, newV);
-        }
-
-        @Override // android.database.sqlite.SQLiteOpenHelper
-        public void onOpen(SQLiteDatabase db) {
-            if (SomcMediaProvider.DEBUG) {
-                Log.d("SomcMediaProvider", "DatabaseHelper onOpen()");
-            }
-            this.mDBPath = db.getPath();
+        public DatabaseHelper(Context ctx, SomcCustomFunction cb1, SomcCustomFunction cb2) {
+            mCb1 = cb1;
+            mCb2 = cb2;
+            mContext = ctx;
         }
 
         public SQLiteDatabase getWritableDB() {
-            SQLiteOpenHelper helper = getMediaProviderDBHelper();
-            if (helper == null) {
-                return null;
+            if (mOrgDBHelper == null) {
+                getMediaProviderDBHelper();
             }
-            SQLiteDatabase db = helper.getWritableDatabase();
-            if (!isAttach(db)) {
-                this.mOrgDBHelper = null;
-                SQLiteOpenHelper helper2 = getMediaProviderDBHelper();
-                if (helper2 != null) {
-                    return helper2.getWritableDatabase();
-                }
-                return db;
-            }
-            return db;
-        }
-
-        public SQLiteDatabase getWritableDBAsync() {
-            SQLiteOpenHelper helper = this.mOrgDBHelper;
-            if (helper == null) {
-                return null;
-            }
-            SQLiteDatabase db = helper.getWritableDatabase();
-            return db;
+            return (mOrgDBHelper != null) ? mOrgDBHelper.getWritableDatabase() : null;
         }
 
         public SQLiteDatabase getReadableDB() {
-            SQLiteOpenHelper helper = getMediaProviderDBHelper();
-            if (helper == null) {
-                return null;
+            if (mOrgDBHelper == null) {
+                getMediaProviderDBHelper();
             }
-            SQLiteDatabase db = helper.getReadableDatabase();
-            if (!isAttach(db)) {
-                this.mOrgDBHelper = null;
-                SQLiteOpenHelper helper2 = getMediaProviderDBHelper();
-                if (helper2 != null) {
-                    return helper2.getReadableDatabase();
-                }
-                return db;
-            }
-            return db;
+            return (mOrgDBHelper != null) ? mOrgDBHelper.getReadableDatabase() : null;
         }
 
         private synchronized SQLiteOpenHelper getMediaProviderDBHelper() {
             SQLiteOpenHelper helper;
             ContentProvider mp;
-            helper = this.mOrgDBHelper;
+            helper = mOrgDBHelper;
             if (helper == null && (mp = SomcMediaProvider.this.getMediaProvider()) != null) {
                 try {
-                    Context cxt = mp.getContext();
-                    ClassLoader loader = cxt.getClassLoader();
+                    Context ctx = mp.getContext();
+                    ClassLoader loader = ctx.getClassLoader();
                     Class<?> cls = loader.loadClass("com.android.providers.media.MediaProvider");
                     Method method = cls.getDeclaredMethod("getDatabaseForUri", Uri.class);
                     method.setAccessible(true);
                     Uri uri = MediaStore.Files.getContentUri("external");
                     helper = (SQLiteOpenHelper) method.invoke(mp, uri);
                     SQLiteDatabase orgDB = helper.getWritableDatabase();
-                    orgDB.execSQL("ATTACH DATABASE '" + this.mDBPath + "' AS ext");
+                    ensureSchema(orgDB);
                     createViews(orgDB);
+                    createInsertTriggers(orgDB);
+                    createUpdateTriggers(orgDB);
+                    createDeleteTriggers(orgDB);
                     orgDB.setCustomScalarFunction("_SOMC_FILETYPE_CB", new java.util.function.UnaryOperator<String>(){
                         public String apply(String arg){
                             mCb1.callback(new String[]{arg});
@@ -310,167 +269,38 @@ public class SomcMediaProvider extends ContentProvider {
                             return "";
                         }
                     });
-                    createUpdateTriggers(orgDB);
-                    createInsertTriggers(orgDB);
-                    createDeleteTriggers(orgDB);
-                    this.mOrgDBHelper = helper;
-                    Log.i("SomcMediaProvider", "ATTACH DATABASE SUCCESS !!");
+                    mOrgDBHelper = helper;
+                    Log.i(TAG, "ENSURE DATABASE SUCCESS !!");
                     return helper;
                 } catch (Exception e) {
                     if (e instanceof InvocationTargetException) {
                         Throwable mCause = ((InvocationTargetException) e).getCause();
-                        Log.e("SomcMediaProvider", "ATTACH DATABASE FAILURE !!\nCaused by: ", mCause);
+                        Log.e(TAG, "ENSURE DATABASE FAILURE !!\nCaused by: ", mCause);
                         return null;
                     }
-                    Log.e("SomcMediaProvider", "ATTACH DATABASE FAILURE !!", e);
+                    Log.e(TAG, "ENSURE DATABASE FAILURE !!", e);
                 }
             }
-            return null;
+            return helper;
         }
 
-        private boolean isAttach(SQLiteDatabase db) {
-            List<Pair<String, String>> attachDbs = db.getAttachedDbs();
-            for (Pair<String, String> p : attachDbs) {
-                String name = (String) p.first;
-                if (name.equals("ext")) {
-                    return true;
-                }
-            }
-            return false;
-        }
+        private void ensureSchema(SQLiteDatabase db) {
+            db.execSQL(
+                "CREATE TABLE IF NOT EXISTS files_ext (" +
+                "  files_id INTEGER PRIMARY KEY," +
+                "  userrating INTEGER," +
+                "  somcdatetaken INTEGER," +
+                "  somctype INTEGER DEFAULT -1," +
+                "  somchash TEXT," +
+                "  somccategory INTEGER DEFAULT 0," +
+                "  is_hdr INTEGER DEFAULT -1," +
+                "  reserved1 INTEGER," +
+                "  reserved2 TEXT" +
+                ")"
+            );
 
-        public boolean isFirstTime() {
-            SharedPreferences pref = this.mContext.getSharedPreferences("somc", 0);
-            if (pref == null) {
-                return false;
-            }
-            boolean isFirstTime = pref.getBoolean("FirstTime", false);
-            return isFirstTime;
-        }
-
-        public void setFirstTime(boolean val) {
-            SharedPreferences pref = this.mContext.getSharedPreferences("somc", 0);
-            if (pref != null) {
-                SharedPreferences.Editor editor = pref.edit();
-                editor.putBoolean("FirstTime", val);
-                editor.commit();
-            }
-        }
-
-        private int getLegacyExtVersion(SQLiteDatabase db) {
-            int version = 0;
-
-            // Does legacy table exist?
-            try (Cursor c = db.rawQuery(
-                    "SELECT COUNT(*) FROM main.sqlite_master " +
-                    "WHERE type='table' AND name='semc_metadata'", null)) {
-                if (c.moveToFirst() && c.getInt(0) > 0) {
-                    // Try KV-style first
-                    try (Cursor c1 = db.rawQuery(
-                            "SELECT value FROM semc_metadata WHERE key='version'", null)) {
-                        if (c1.moveToFirst()) {
-                            version = c1.getInt(0);
-                        }
-                    } catch (Exception e) {
-                        Log.e("SomcMediaProvider", "Old version does not exist");
-                    }
-
-                    // Fallback: legacy column
-                    if (version == 0) {
-                        try (Cursor c2 = db.rawQuery(
-                                "SELECT version FROM semc_metadata", null)) {
-                            if (c2.moveToFirst()) {
-                                version = c2.getInt(0);
-                            }
-                        } catch (Exception ignore) { /* keep version = 0 */ }
-                    }
-                }
-            } catch (Exception e) {
-                Log.e("SomcMediaProvider", "Query to sqlite_master failed");
-            }
-
-            return version;
-        }
-
-        private boolean isTableEntriesEmpty(SQLiteDatabase db) {
-            boolean empty = false;
-            Cursor c = null;
-            try {
-                try {
-                    c = db.rawQuery("SELECT COUNT(*) FROM ext.files_ext", null);
-                    if (c.moveToFirst()) {
-                        empty = c.getInt(0) == 0;
-                    }
-                } catch (Exception e) {
-                    Log.e("SomcMediaProvider", "Query to files_ext failed");
-                    empty = true;
-                }
-                return empty;
-            } finally {
-                if (c != null) {
-                    c.close();
-                }
-            }
-        }
-
-        public void handoverDatabases(SQLiteDatabase db) throws SQLException {
-            Log.i("SomcMediaProvider", "handoverDatabases begin");
-            if (!isTableEntriesEmpty(db)) {
-                Log.w("SomcMediaProvider", "handoverDatabases failed due to non-empty in files_ext");
-                return;
-            }
-            int oldVersion = getLegacyExtVersion(db);
-            Log.i("SomcMediaProvider", "old version = " + oldVersion);
-            if (oldVersion > 0 && oldVersion < 400) {
-                db.execSQL("DROP TABLE IF EXISTS main.semc_metadata;");
-                db.execSQL("DROP TABLE IF EXISTS main.somc_types;");
-                db.execSQL("DROP VIEW IF EXISTS main.images_ext;");
-                db.execSQL("DROP VIEW IF EXISTS main.video_ext;");
-                db.execSQL("DROP VIEW IF EXISTS main.audio_ext;");
-                db.execSQL("DROP VIEW IF EXISTS main.album_info_ext;");
-                db.execSQL("DROP VIEW IF EXISTS main.semc_metadata_version;");
-                db.execSQL("DROP TRIGGER IF EXISTS main.files_ext_instead_of_update;");
-                db.execSQL("DROP TRIGGER IF EXISTS main.somctypes_before_update;");
-                db.execSQL("DROP TRIGGER IF EXISTS main.somctypes_on_delete;");
-                if (oldVersion < 300) {
-                    db.execSQL("INSERT INTO ext.files_ext (files_id,userrating,somctype,somchash) SELECT files_id,userrating,somctype,somchash FROM main.files_ext");
-                    db.execSQL("UPDATE ext.files_ext SET somccategory=0 WHERE somctype=0");
-                    db.execSQL("UPDATE ext.files_ext SET somccategory=1 WHERE somctype=13 OR somctype=42 OR somctype=5 OR somctype=6 OR somctype=7 OR somctype=8 OR somctype=9 OR somctype=10 OR somctype=11 OR somctype=12 OR somctype=14");
-                    db.execSQL("UPDATE ext.files_ext SET somccategory=2 WHERE somctype=129 OR somctype=130");
-                    db.execSQL("UPDATE ext.files_ext SET somccategory=3 WHERE somctype=2 OR somctype=4");
-                } else if (oldVersion < 303) {
-                    db.execSQL("INSERT INTO ext.files_ext (files_id,userrating,somctype,somchash,somccategory) SELECT files_id,userrating,somctype,somchash,somccategory FROM main.files_ext");
-                } else if (oldVersion < 400) {
-                    db.execSQL("INSERT INTO ext.files_ext (files_id,userrating,somcdatetaken,somctype,somchash,somccategory) SELECT files_id,userrating,somcdatetaken,somctype,somchash,somccategory FROM main.files_ext");
-                }
-                db.execSQL("DROP TABLE IF EXISTS main.files_ext;");
-            }
-            Log.i("SomcMediaProvider", "handoverDatabases end");
-        }
-
-        private void upgradeDatabase(SQLiteDatabase db, int oldVersion, int newVersion) throws SQLException {
-            if (newVersion != 401) {
-                Log.e("SomcMediaProvider", "Illegal request. Got " + newVersion + ", expected 401");
-                throw new IllegalArgumentException();
-            }
-            if (oldVersion > newVersion) {
-                Log.e("SomcMediaProvider", "Illegal request: can't downgrade from " + oldVersion + " to " + newVersion + ". Did you forget to wipe date?");
-                throw new IllegalArgumentException();
-            }
-            if (oldVersion <= 0) {
-                if (SomcMediaProvider.DEBUG) {
-                    Log.d("SomcMediaProvider", "upgrade to initial");
-                }
-                db.execSQL("DROP TABLE IF EXISTS files_ext;");
-                db.execSQL("CREATE TABLE files_ext (files_id INTEGER PRIMARY KEY AUTOINCREMENT,userrating INTEGER,somcdatetaken INTEGER,somctype INTEGER DEFAULT -1,somchash TEXT,somccategory INTEGER DEFAULT 0,is_hdr INTEGER DEFAULT -1,reserved1 INTEGER,reserved2 TEXT);");
-            } else {
-                if (SomcMediaProvider.DEBUG) {
-                    Log.d("SomcMediaProvider", "upgrade to 401");
-                }
-                db.execSQL("ALTER TABLE files_ext ADD COLUMN reserved1 INTEGER");
-                db.execSQL("ALTER TABLE files_ext ADD COLUMN reserved2 TEXT");
-            }
-            Log.i("SomcMediaProvider", db.getPath() + " upgrade OK from " + oldVersion + " to " + newVersion);
+            db.execSQL("CREATE INDEX IF NOT EXISTS idx_files_ext_files_id ON files_ext(files_id)");
+            db.execSQL("CREATE INDEX IF NOT EXISTS idx_files_ext_category ON files_ext(somccategory)");
         }
 
         private void createUpdateTriggers(SQLiteDatabase db) throws SQLException {
@@ -513,7 +343,7 @@ public class SomcMediaProvider extends ContentProvider {
 
         private void createViews(SQLiteDatabase db) throws SQLException {
             db.execSQL("DROP VIEW IF EXISTS files_with_ext;");
-            db.execSQL("CREATE TEMPORARY VIEW files_with_ext AS SELECT files.*, files_ext.* FROM files LEFT OUTER JOIN files_ext ON files._id=files_ext.files_id;");
+            db.execSQL("CREATE VIEW files_with_ext AS SELECT files.*, files_ext.* FROM files LEFT OUTER JOIN files_ext ON files._id=files_ext.files_id;");
         }
     }
 
@@ -554,12 +384,8 @@ public class SomcMediaProvider extends ContentProvider {
             this.mSomcSequenceTypes = new ArrayList<>();
             this.mSomcCoverTypes = new ArrayList<>();
             initSomcType(0, "", "", 0);
-            initSomcType(13, "", "", 1);
-            initSomcType(42, "", "image/jpeg", 1);
             initSomcType(2, "DCIM/XPERIA/BURST", "image/jpeg", 3);
-            initSomcType(129, "DCIM/XPERIA/BURST", "image/jpeg", 2);
             initSomcType(4, "DCIM/XPERIA/TIMESHIFT", "image/jpeg", 3);
-            initSomcType(130, "DCIM/XPERIA/TIMESHIFT", "image/jpeg", 2);
             initSomcType(5, "DCIM/XPERIA/INFO_EYE", "image/jpeg", 1);
             initSomcType(6, "DCIM/XPERIA/SOCIAL_LIVE", "video/mp4", 1);
             initSomcType(7, "DCIM/XPERIA/AR_EFFECT", "", 1);
@@ -568,26 +394,30 @@ public class SomcMediaProvider extends ContentProvider {
             initSomcType(10, "DCIM/XPERIA/WIKITUDE", "image/jpeg", 1);
             initSomcType(11, "DCIM/XPERIA/TIMESHIFT_VIDEO/120F", "video/mp4", 1);
             initSomcType(12, "DCIM/XPERIA/TIMESHIFT_VIDEO", "video/mp4", 1);
+            initSomcType(13, "", "", 1);
             initSomcType(14, "DCIM/XPERIA/HIGHLIGHT_MOVIE", "video/mp4", 1);
+            initSomcType(42, "", "image/jpeg", 1);
+            initSomcType(129, "DCIM/XPERIA/BURST", "image/jpeg", 2);
+            initSomcType(130, "DCIM/XPERIA/TIMESHIFT", "image/jpeg", 2);
         }
 
         private void initSomcType(int id, String path, String mimeType, int category) {
             switch (category) {
                 case 1:
                     if (SomcMediaProvider.DEBUG) {
-                        Log.d("SomcMediaProvider", "Found/added single type at " + path);
+                        Log.d(TAG, "Found/added single type at " + path);
                     }
                     this.mSomcTypes.add(new SomcType(id, mimeType, "%_/" + path + "/%_.%_", ".*/" + path + "/[^/]*\\.[a-z0-9_]*$"));
                     break;
                 case 2:
                     if (SomcMediaProvider.DEBUG) {
-                        Log.d("SomcMediaProvider", "Found/added sequence type at " + path);
+                        Log.d(TAG, "Found/added sequence type at " + path);
                     }
                     this.mSomcSequenceTypes.add(new SomcType(id, mimeType, "%_/" + path + "/%_/%_.%_", ".*/" + path + "/[^/]*/[^/]*\\.[a-z0-9_]*$"));
                     break;
                 case 3:
                     if (SomcMediaProvider.DEBUG) {
-                        Log.d("SomcMediaProvider", "Found/added cover type at " + path);
+                        Log.d(TAG, "Found/added cover type at " + path);
                     }
                     this.mSomcCoverTypes.add(new SomcType(id, mimeType, "%_/" + path + "/%_/%_.%_", ".*/" + path + "/[^/]*/[^/]*\\.[a-z0-9_]*$"));
                     break;
@@ -606,20 +436,71 @@ public class SomcMediaProvider extends ContentProvider {
         }
     }
 
-    @Override // android.content.ContentProvider
-    public boolean onCreate() throws SQLException {
-        Log.i("SomcMediaProvider", "onCreate(): begin");
-        this.mSomcFileType = new SomcFileType();
-        this.mDBHelper = new DatabaseHelper(getContext(), "external_somc.db", this.mSomcFileTypeCallback, this.mCoverRemovedCallback);
-        if (this.mDBHelper != null) {
-            this.mDBHelper.getWritableDatabase();
-            SQLiteDatabase db = this.mDBHelper.getWritableDB();
-            if (db != null && this.mDBHelper.isFirstTime()) {
-                this.mDBHelper.setFirstTime(false);
-                this.mDBHelper.handoverDatabases(db);
-            }
+    private boolean isVolumeReady(Context context, String volumeName) {
+        return MediaStore.getExternalVolumeNames(context).contains(volumeName);
+    }
+    
+    private boolean isSchemaAlive() {
+        if (mDBHelper == null)
+            return false;
+
+        SQLiteDatabase db = mDBHelper.getReadableDB();
+        if (db == null)
+            return false;
+
+        try (Cursor c = db.rawQuery(
+                "SELECT 1 FROM sqlite_master WHERE type='view' AND name='files_with_ext'",
+                null)) {
+            return c.moveToFirst();
+        } catch (Exception e) {
+            // If anything goes wrong, treat schema as missing
+            return false;
         }
-        Log.i("SomcMediaProvider", "onCreate(): end");
+    }
+
+    private boolean ensureInitialized() {
+        if (mDBHelper != null && mSomcFileType != null && isSchemaAlive()) {
+            return true;
+        }
+
+        final Context ctx = getContext();
+        if (ctx == null) {
+            Log.w(TAG, "ensureInitialized(): No context yet.");
+            return false;
+        }
+
+        if (!isVolumeReady(ctx, "external_primary")) {
+            Log.i(TAG, "ensureInitialized(): 'external_primary' not ready, deferring.");
+            return false;
+        }
+
+        synchronized (mDbLock) {
+            if (mDBHelper != null && mSomcFileType != null && isSchemaAlive()) {
+                return true;
+            }
+
+            Log.i(TAG, "ensureInitialized(): Creating SomcFileType + DatabaseHelper.");
+            mSomcFileType = new SomcFileType();
+            mDBHelper = new DatabaseHelper(ctx, mSomcFileTypeCallback, mCoverRemovedCallback);
+
+            if (mDBHelper == null) {
+                Log.e(TAG, "ensureInitialized(): Failed to create DatabaseHelper.");
+                return false;
+            }
+            if (!isSchemaAlive()) {
+                Log.e(TAG, "ensureInitialized(): Couldn't set up database.");
+                return false;
+            }
+
+            return true;
+        }
+    }
+
+    @Override // android.content.ContentProvider
+    public boolean onCreate() {
+        Log.i(TAG, "onCreate(): Begin");
+        ensureInitialized();
+        Log.i(TAG, "onCreate(): End (mDBHelper=" + (mDBHelper != null) + ")");
         return true;
     }
 
@@ -641,7 +522,7 @@ public class SomcMediaProvider extends ContentProvider {
     @Override // android.content.ContentProvider
     public ContentProviderResult[] applyBatch(ArrayList<ContentProviderOperation> operations) throws OperationApplicationException {
         if (DEBUG) {
-            Log.d("SomcMediaProvider", "applyBatch: " + operations.toString());
+            Log.d(TAG, "applyBatch: " + operations.toString());
         }
         ContentProviderResult[] result = super.applyBatch(operations);
         if (result != null) {
@@ -655,6 +536,12 @@ public class SomcMediaProvider extends ContentProvider {
 
     @Override // android.content.ContentProvider
     public Cursor query(Uri uri, String[] proj, String select, String[] selectArgs, String sort) {
+        if (!ensureInitialized()) {
+            String[] cols = (proj != null && proj.length > 0)
+                    ? proj
+                    : new String[] { "_id" };
+            return new MatrixCursor(cols, 0);
+        }
         String str;
         String select2;
         String nonotify = "";
@@ -672,7 +559,7 @@ public class SomcMediaProvider extends ContentProvider {
             sb.append(", sort=");
             str = sort;
             sb.append(str);
-            Log.d("SomcMediaProvider", sb.toString());
+            Log.d(TAG, sb.toString());
         } else {
             str = sort;
         }
@@ -702,14 +589,15 @@ public class SomcMediaProvider extends ContentProvider {
         } else {
             select2 = "(media_type IS NOT NULL OR old_id IS NULL)";
         }
-        SQLiteDatabase db = this.mDBHelper.getReadableDB();
+        SQLiteDatabase db = SomcMediaProvider.this.mDBHelper.getReadableDB();
         if (db != null) {
             mCursor = qb.query(db, proj, select2, selectArgs, null, null, str, limit);            
         }
-        if (mCursor != null)
-            nonotify = uri.getQueryParameter("nonotify") ;
+        if (mCursor != null) {
+            nonotify = uri.getQueryParameter("nonotify");
             if (nonotify == null || !nonotify.equals("1"))
             	mCursor.setNotificationUri(getContext().getContentResolver(), uri);
+        }
         return mCursor;
     }
 
@@ -720,8 +608,11 @@ public class SomcMediaProvider extends ContentProvider {
 
     @Override // android.content.ContentProvider
     public int delete(Uri uri, String userWhere, String[] whereArgs) {
+        if (!ensureInitialized()) {
+            return 0;
+        }
         if (DEBUG) {
-            Log.d("SomcMediaProvider", "delete: uri=" + uri
+            Log.d(TAG, "delete: uri=" + uri
                     + ", userWhere=" + userWhere
                     + ", whereArgs=" + java.util.Arrays.toString(whereArgs));
         }
@@ -737,8 +628,8 @@ public class SomcMediaProvider extends ContentProvider {
                 throw new IllegalArgumentException("Unknown URI " + uri);
         }
 
-        final android.database.sqlite.SQLiteDatabase db = mDBHelper.getWritableDB();
-        final android.content.ContentProvider mp = getMediaProvider();
+        final SQLiteDatabase db = SomcMediaProvider.this.mDBHelper.getWritableDB();
+        final ContentProvider mp = getMediaProvider();
 
         if (db != null && mp != null) {
             android.database.Cursor c = null;
@@ -784,8 +675,11 @@ public class SomcMediaProvider extends ContentProvider {
 
     @Override // android.content.ContentProvider
     public int update(Uri uri, ContentValues values, String userWhere, String[] whereArgs) {
+        if (!ensureInitialized()) {
+            return 0;
+        }
         if (DEBUG) {
-            Log.d("SomcMediaProvider", "update: uri=" + uri
+            Log.d(TAG, "update: uri=" + uri
                     + ", initVals=" + values
                     + ", userWhere=" + userWhere
                     + ", whereArgs=" + Arrays.toString(whereArgs));
@@ -801,7 +695,7 @@ public class SomcMediaProvider extends ContentProvider {
         }
 
         int count = 0;
-        final SQLiteDatabase db = mDBHelper.getWritableDB();
+        final SQLiteDatabase db = SomcMediaProvider.this.mDBHelper.getWritableDB();
         if (db == null) return 0;
 
         // Compose WHERE: restrict to rows owned by us, then append caller's clause
@@ -877,6 +771,9 @@ public class SomcMediaProvider extends ContentProvider {
 
     /* JADX INFO: Access modifiers changed from: private */
     public void updateFileType(SQLiteDatabase db, String path, String mimeType, String rowId) {
+        if (!ensureInitialized()) {
+            return;
+        }
         if (mimeType == null && path != null) {
             mimeType = MediaFile.getMimeTypeForFile(path);
         }
@@ -899,7 +796,7 @@ public class SomcMediaProvider extends ContentProvider {
             }
             if (type != -1) {
                 if (DEBUG) {
-                    Log.d("SomcMediaProvider", path + ": somctype=" + type + ", category=" + category);
+                    Log.d(TAG, path + ": somctype=" + type + ", category=" + category);
                 }
                 ContentValues vals = new ContentValues();
                 vals.put("somctype", Integer.valueOf(type));
@@ -915,6 +812,9 @@ public class SomcMediaProvider extends ContentProvider {
                             String mimeType,
                             String bucketId,
                             boolean demoteCurrent) {
+        if (!ensureInitialized()) {
+            return;
+        }
         // Normalize mimeType.
         if (mimeType == null && path != null) {
             mimeType = MediaFile.getMimeTypeForFile(path);
