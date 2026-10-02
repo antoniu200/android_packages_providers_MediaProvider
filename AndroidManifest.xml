@@ -52,7 +52,14 @@
                 android:grantUriPermissions="true"
                 android:forceUriPermissions="true"
                 android:exported="true" />
-
+                
+        <provider
+                android:name="com.sonymobile.media.SomcMediaProvider"
+                android:authorities="somcmedia"
+                android:grantUriPermissions="true"
+                android:forceUriPermissions="true"
+                android:exported="true" />
+        
         <provider
                 android:name="com.android.providers.media.MediaDocumentsProvider"
                 android:label="@string/storage_description"
