@@ -230,6 +230,9 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         try {
             db.beginTransaction();
             createLatestViews(db, mInternal);
+            if (shouldCreateSomcSchema(mInternal)) {
+                createSomcViewUpdateTrigger(db);
+            }
             db.setTransactionSuccessful();
         } finally {
             db.endTransaction();
@@ -237,7 +240,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         }
     }
 
-/*    @Override
+    @Override
     public SQLiteDatabase getReadableDatabase() {
         throw new UnsupportedOperationException("All database operations must be routed through"
                 + " runWithTransaction() or runWithoutTransaction() to avoid deadlocks");
@@ -247,7 +250,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
     public SQLiteDatabase getWritableDatabase() {
         throw new UnsupportedOperationException("All database operations must be routed through"
                 + " runWithTransaction() or runWithoutTransaction() to avoid deadlocks");
-    }*/
+    }
 
     @VisibleForTesting
     SQLiteDatabase getWritableDatabaseForTest() {
@@ -392,6 +395,9 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                 makePristineIndexes(db);
                 migrateFromLegacy(db);
                 createLatestIndexes(db, mInternal);
+                if (shouldCreateSomcSchema(mInternal)) {
+                    createSomcIndexes(db);
+                }
             } finally {
                 mSchemaLock.writeLock().unlock();
                 // Clear flag, since we should only attempt once
@@ -833,6 +839,10 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         createLatestViews(db, mInternal);
         createLatestTriggers(db, mInternal);
         createLatestIndexes(db, mInternal);
+        if (shouldCreateSomcSchema(mInternal)) {
+            createSomcViewUpdateTrigger(db);
+            createSomcIndexes(db);
+        }
 
         // Since this code is used by both the legacy and modern providers, we
         // only want to migrate when we're running as the modern provider
@@ -1158,6 +1168,74 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         sMigrateColumns.add(MediaStore.DownloadColumns.REFERER_URI);
     }
 
+    private boolean shouldCreateSomcSchema(boolean internal) {
+        return !internal && !mLegacyProvider;
+    }
+
+    private static void createSomcTable(SQLiteDatabase db) {
+        db.execSQL("CREATE TABLE IF NOT EXISTS files_ext ("
+                + "files_id INTEGER PRIMARY KEY,"
+                + "userrating INTEGER,"
+                + "somcdatetaken INTEGER,"
+                + "somctype INTEGER DEFAULT -1,"
+                + "somchash TEXT,"
+                + "somccategory INTEGER DEFAULT 0,"
+                + "is_hdr INTEGER DEFAULT -1,"
+                + "reserved1 INTEGER,"
+                + "reserved2 TEXT)");
+    }
+
+    private static void createSomcView(SQLiteDatabase db) {
+        db.execSQL("CREATE VIEW files_with_ext AS "
+                + "SELECT files.*, files_ext.* FROM files "
+                + "LEFT OUTER JOIN files_ext ON files._id=files_ext.files_id");
+    }
+
+    private static void createSomcIndexes(SQLiteDatabase db) {
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_files_ext_files_id "
+                + "ON files_ext(files_id)");
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_files_ext_category "
+                + "ON files_ext(somccategory)");
+    }
+
+    private static String buildSomcUpdateQueryPart(
+            SQLiteDatabase db, String table, String skipColumn) {
+        final StringBuilder sb = new StringBuilder();
+        try (Cursor c = db.rawQuery("PRAGMA table_info(" + table + ")", null)) {
+            while (c.moveToNext()) {
+                final String name = c.getString(1);
+                if (skipColumn.equals(name)) {
+                    continue;
+                }
+                if (sb.length() > 0) {
+                    sb.append(',');
+                }
+                sb.append(name).append("=NEW.").append(name);
+            }
+        }
+        return sb.toString();
+    }
+
+    private static void createSomcViewUpdateTrigger(SQLiteDatabase db) {
+        final String orgSet = buildSomcUpdateQueryPart(db, "files", "_id");
+        final String extSet = buildSomcUpdateQueryPart(db, "files_ext", "files_id");
+
+        final StringBuilder sql = new StringBuilder()
+                .append("CREATE TRIGGER files_with_ext_instead_of_update ")
+                .append("INSTEAD OF UPDATE ON files_with_ext BEGIN ");
+
+        if (!orgSet.isEmpty()) {
+            sql.append("UPDATE files SET ").append(orgSet)
+                    .append(" WHERE _id=OLD._id;");
+        }
+        if (!extSet.isEmpty()) {
+            sql.append("UPDATE files_ext SET ").append(extSet)
+                    .append(" WHERE files_id=OLD._id;");
+        }
+        sql.append("END;");
+        db.execSQL(sql.toString());
+    }
+
     private static void makePristineViews(SQLiteDatabase db) {
         // drop all views
         Cursor c = db.query("sqlite_master", new String[] {"name"}, "type is 'view'",
@@ -1171,8 +1249,16 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
     private void createLatestViews(SQLiteDatabase db, boolean internal) {
         makePristineViews(db);
 
+        final boolean createSomcSchema = shouldCreateSomcSchema(internal);
+        if (createSomcSchema) {
+            createSomcTable(db);
+        }
+
         if (mColumnAnnotation == null) {
             Log.w(TAG, "No column annotation provided; not creating views");
+            if (createSomcSchema) {
+                createSomcView(db);
+            }
             return;
         }
 
@@ -1273,6 +1359,10 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                 + " FROM audio"
                 + " WHERE is_pending=0 AND is_trashed=0 AND volume_name IN " + filterVolumeNames
                 + " GROUP BY genre_id");
+
+        if (createSomcSchema) {
+            createSomcView(db);
+        }
     }
 
     private String getColumnsForCollection(Class<?> collection) {
@@ -1290,7 +1380,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         c.close();
     }
 
-    private static void createLatestTriggers(SQLiteDatabase db, boolean internal) {
+    private void createLatestTriggers(SQLiteDatabase db, boolean internal) {
         makePristineTriggers(db);
 
         final String insertArg =
@@ -1310,6 +1400,31 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                 + " BEGIN SELECT _UPDATE(" + updateArg + "); END");
         db.execSQL("CREATE TRIGGER files_delete AFTER DELETE ON files"
                 + " BEGIN SELECT _DELETE(" + deleteArg + "); END");
+
+        if (shouldCreateSomcSchema(internal)) {
+            db.execSQL(
+                    "CREATE TRIGGER somc_files_ext_insert "
+                    + "AFTER INSERT ON files "
+                    + "WHEN NEW.media_type IN (1,3) "
+                    + "BEGIN "
+                    + "INSERT OR IGNORE INTO files_ext(files_id) VALUES(NEW._id); "
+                    + "END");
+
+            db.execSQL(
+                    "CREATE TRIGGER somc_files_ext_media_type "
+                    + "AFTER UPDATE OF media_type ON files "
+                    + "WHEN NEW.media_type IN (1,3) "
+                    + "BEGIN "
+                    + "INSERT OR IGNORE INTO files_ext(files_id) VALUES(NEW._id); "
+                    + "END");
+
+            db.execSQL(
+                    "CREATE TRIGGER somc_files_ext_delete "
+                    + "AFTER DELETE ON files "
+                    + "BEGIN "
+                    + "DELETE FROM files_ext WHERE files_id=OLD._id; "
+                    + "END");
+        }
     }
 
     private static void makePristineIndexes(SQLiteDatabase db) {
@@ -1630,7 +1745,8 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
     // Leave some gaps in database version tagging to allow R schema changes
     // to go independent of S schema changes.
     static final int VERSION_S = 1209;
-    static final int VERSION_LATEST = VERSION_S;
+    static final int VERSION_SOMC = 1210;
+    static final int VERSION_LATEST = VERSION_SOMC;
 
     /**
      * This method takes care of updating all the tables in the database to the
@@ -1805,6 +1921,9 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
             if (fromVersion < 1209) {
                 // Empty version bump to ensure views are recreated
             }
+            if (fromVersion < 1210) {
+                // Sony extension schema is created by the common recreation path below.
+            }
 
             // If this is the legacy database, it's not worth recomputing data
             // values locally, since they'll be recomputed after the migration
@@ -1821,6 +1940,10 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         // cheap and it's an easy way to ensure they're defined consistently
         createLatestViews(db, internal);
         createLatestTriggers(db, internal);
+        if (shouldCreateSomcSchema(internal)) {
+            createSomcViewUpdateTrigger(db);
+            createSomcIndexes(db);
+        }
 
         getOrCreateUuid(db);
 
